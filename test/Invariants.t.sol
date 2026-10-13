@@ -158,16 +158,23 @@ contract LedgerHandler is Test {
         brokerBps = uint16(bound(brokerBps, 0, 10_000));
         houseBps = uint16(bound(houseBps, 0, 10_000 - brokerBps));
         vm.startPrank(owner);
+        // an open SVG sale freezes its split; the module collection's split can move at any time
+        vm.expectRevert(ArtHouse.SaleOpen.selector);
         house.setSplit(col, brokerBps, houseBps, 10_000 - brokerBps - houseBps);
+        house.closeSale(col);
+        house.setSplit(col, brokerBps, houseBps, 10_000 - brokerBps - houseBps);
+        house.openSale(col);
         house.setSplit(modCol, brokerBps, houseBps, 10_000 - brokerBps - houseBps);
         vm.stopPrank();
     }
 
     function toggleBroker(uint256 seed) external {
         address b = _actor(seed);
+        bool approved = house.isBroker(b);
         vm.prank(owner);
-        if (house.isBroker(b)) house.revokeBroker(b);
+        if (approved) house.revokeBroker(b);
         else house.approveBroker(b);
+        assertEq(house.isBroker(b), !approved);
     }
 
     function setPayout(uint256 seed) external {
@@ -264,6 +271,9 @@ contract ArtHouseLedgerInvariantTest is Fixture {
 
 contract AuctionHandler is Test {
     ArtifactsAuction internal auction;
+    ArtHouse internal house;
+    address internal owner;
+    uint256 internal modCol;
     address[] internal actors;
     uint256 public ethIn;
     uint256 public ethOut;
@@ -271,10 +281,30 @@ contract AuctionHandler is Test {
     uint64 public lastEnd;
     bool public everSettled;
 
-    constructor(ArtifactsAuction auction_, address[] memory actors_) {
+    constructor(ArtifactsAuction auction_, ArtHouse house_, address owner_, uint256 modCol_, address[] memory actors_) {
         auction = auction_;
+        house = house_;
+        owner = owner_;
+        modCol = modCol_;
         actors = actors_;
         lastEnd = auction_.endTime();
+    }
+
+    /// @dev The curator may revoke or re-approve the auction as a ledger module at any point.
+    function toggleModule() external {
+        bool approved = house.isModule(address(auction));
+        vm.prank(owner);
+        if (approved) house.revokeModule(address(auction));
+        else house.approveModule(address(auction), modCol);
+        assertEq(house.isModule(address(auction)), !approved);
+    }
+
+    function forwardProceeds() external {
+        uint256 held = auction.heldProceeds();
+        if (held == 0 || !house.isModule(address(auction))) return;
+        auction.forwardProceeds();
+        paidToHouse += held;
+        assertEq(auction.heldProceeds(), 0);
     }
 
     function bid(uint256 actorSeed, uint256 extra, bool tooLow) external {
@@ -324,8 +354,14 @@ contract AuctionHandler is Test {
 
     function settle() external {
         if (auction.settled() || block.timestamp < auction.endTime() || auction.highBidder() == address(0)) return;
+        bool open = house.isModule(address(auction));
         auction.settle();
-        paidToHouse += auction.highBid();
+        if (open) {
+            paidToHouse += auction.highBid();
+            assertEq(auction.heldProceeds(), 0);
+        } else {
+            assertEq(auction.heldProceeds(), auction.highBid(), "a revoked module holds the winning bid");
+        }
         everSettled = true;
     }
 }
@@ -343,20 +379,22 @@ contract AuctionInvariantTest is Fixture {
         actorList.push(BOB);
         actorList.push(CAROL);
         actorList.push(DAVE);
-        handler = new AuctionHandler(auction, actorList);
+        handler = new AuctionHandler(auction, house, OWNER, artifactsCollection, actorList);
         targetContract(address(handler));
     }
 
     /// forge-config: default.invariant.runs = 64
     /// forge-config: default.invariant.depth = 60
-    function invariant_auctionHoldsExactlyRefundsPlusOpenHighBid() public view {
+    function invariant_auctionHoldsExactlyRefundsPlusOpenHighBidPlusHeld() public view {
         uint256 owed;
         for (uint256 i; i < actorList.length; ++i) {
             owed += auction.refunds(actorList[i]);
         }
         if (!auction.settled()) owed += auction.highBid();
+        else owed += auction.heldProceeds();
         assertEq(address(auction).balance, owed);
         assertEq(handler.ethIn(), address(auction).balance + handler.ethOut() + handler.paidToHouse());
+        if (!auction.settled()) assertEq(auction.heldProceeds(), 0, "nothing is held before settlement");
     }
 
     /// forge-config: default.invariant.runs = 64
@@ -365,8 +403,10 @@ contract AuctionInvariantTest is Fixture {
         if (handler.everSettled()) assertTrue(auction.settled());
         if (auction.settled()) {
             assertEq(factory.assignedTo(256), auction.highBidder());
-            assertEq(house.balances(address(house), ETH) + house.balances(ARTIST_PAYOUT, ETH), auction.highBid());
-            assertEq(address(house).balance, auction.highBid());
+            // the winning bid is either still held by the auction or fully credited in the ledger, never both
+            uint256 inLedger = auction.highBid() - auction.heldProceeds();
+            assertEq(house.balances(address(house), ETH) + house.balances(ARTIST_PAYOUT, ETH), inLedger);
+            assertEq(address(house).balance, inLedger);
         } else {
             assertEq(factory.assignedTo(256), address(0));
             assertEq(address(house).balance, 0);
@@ -382,18 +422,44 @@ contract AuctionInvariantTest is Fixture {
 contract EscrowHandler is Test {
     ArtifactsEscrow internal escrow;
     ArtifactsFactory internal factory;
+    ArtHouse internal house;
+    address internal owner;
+    uint256 internal modCol;
     address[] internal actors;
     uint16[] internal ids;
 
     uint256 public ethIn;
     uint256 public refundsOut;
+    /// @dev Released prices that reached the ledger (module approved at release time).
     uint256 public released;
+    /// @dev Released prices held in the escrow for the seller (module revoked at release time).
+    uint256 public heldForSellers;
 
-    constructor(ArtifactsEscrow escrow_, ArtifactsFactory factory_, address[] memory actors_, uint16[] memory ids_) {
+    constructor(
+        ArtifactsEscrow escrow_,
+        ArtifactsFactory factory_,
+        ArtHouse house_,
+        address owner_,
+        uint256 modCol_,
+        address[] memory actors_,
+        uint16[] memory ids_
+    ) {
         escrow = escrow_;
         factory = factory_;
+        house = house_;
+        owner = owner_;
+        modCol = modCol_;
         actors = actors_;
         ids = ids_;
+    }
+
+    /// @dev The curator may revoke or re-approve the escrow as a ledger module at any point of a resale.
+    function toggleModule() external {
+        bool approved = house.isModule(address(escrow));
+        vm.prank(owner);
+        if (approved) house.revokeModule(address(escrow));
+        else house.approveModule(address(escrow), modCol);
+        assertEq(house.isModule(address(escrow)), !approved);
     }
 
     function _id(uint256 seed) internal view returns (uint16) {
@@ -420,6 +486,13 @@ contract EscrowHandler is Test {
         address b = actors[buyerSeed % actors.length];
         if (b == l.seller) return;
         vm.deal(b, b.balance + l.price);
+        if (_piece(id).transferCount() != l.epoch) {
+            // the piece left and came back since the listing: the listing is dead and takes no money
+            vm.prank(b);
+            vm.expectRevert(ArtifactsEscrow.ListingStale.selector);
+            escrow.buy{value: l.price}(id, keccak256(abi.encode(b)));
+            return;
+        }
         vm.prank(b);
         escrow.buy{value: l.price}(id, keccak256(abi.encode(b)));
         ethIn += l.price;
@@ -440,13 +513,18 @@ contract EscrowHandler is Test {
         if (l.buyer == address(0) || l.keyPostedAt != 0) return;
         vm.prank(l.buyer);
         escrow.cancel(id);
-        assertEq(_piece(id).ownerOf(id), l.seller);
+        ArtifactsPiece p = _piece(id);
+        assertEq(p.ownerOf(id), l.seller);
+        assertEq(p.wrappedKey(), l.sellerKey, "the seller's own key is restored on cancel");
+        if (l.sellerKey.length != 0) assertEq(p.keyHolder(), l.seller);
     }
 
     function confirmOrRelease(uint256 seed, bool byTime, uint256 dt) external {
         uint16 id = _id(seed);
         ArtifactsEscrow.Listing memory l = escrow.listing(id);
         if (l.buyer == address(0) || l.keyPostedAt == 0) return;
+        bool open = house.isModule(address(escrow));
+        uint256 sellerRefundBefore = escrow.refunds(l.seller);
         if (byTime) {
             vm.warp(block.timestamp + bound(dt, 0, 4 days));
             if (block.timestamp < l.keyPostedAt + 72 hours) {
@@ -459,7 +537,13 @@ contract EscrowHandler is Test {
             vm.prank(l.buyer);
             escrow.confirm(id);
         }
-        released += l.price;
+        if (open) {
+            released += l.price;
+            assertEq(escrow.refunds(l.seller), sellerRefundBefore, "ledger path credits nothing here");
+        } else {
+            heldForSellers += l.price;
+            assertEq(escrow.refunds(l.seller) - sellerRefundBefore, l.price, "revoked path holds the full price");
+        }
         ArtifactsPiece p = _piece(id);
         assertEq(p.ownerOf(id), l.buyer);
         assertEq(p.keyHolder(), l.buyer);
@@ -505,7 +589,7 @@ contract EscrowInvariantTest is Fixture {
             claimPiece(e, actorList[i]);
             ids.push(e);
         }
-        handler = new EscrowHandler(escrow, factory, actorList, ids);
+        handler = new EscrowHandler(escrow, factory, house, OWNER, artifactsCollection, actorList, ids);
         targetContract(address(handler));
     }
 
@@ -529,6 +613,8 @@ contract EscrowInvariantTest is Fixture {
         }
         assertEq(address(escrow).balance, owed);
         assertEq(handler.ethIn(), address(escrow).balance + handler.refundsOut() + handler.released());
+        // every wei held for a seller is still inside the escrow until that seller pulls it
+        assertGe(address(escrow).balance + handler.refundsOut(), handler.heldForSellers());
     }
 
     /// forge-config: default.invariant.runs = 64
@@ -539,7 +625,7 @@ contract EscrowInvariantTest is Fixture {
             owed += house.balances(actorList[i], ETH);
         }
         assertEq(address(house).balance, owed);
-        // primary sales (3 ether) plus every released resale
+        // primary sales (3 ether) plus every resale released through the ledger; held resales never reach it
         assertEq(address(house).balance, 3 ether + handler.released());
     }
 }
