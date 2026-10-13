@@ -42,12 +42,18 @@ then `acceptOwnership`); `renounceOwnership` reverts.
 ## ArtHouse ledger
 
 - `approveArtist(artist, name, payout)` / `revokeArtist`; an artist changes its own payout with `setPayout`.
+  Re-approving an already approved artist only renames it: the payout the artist chose is kept and the
+  `payout` argument is ignored. A revoked artist loses write access to its collections (register, upload,
+  finalize) until re-approved; the curator keeps it.
 - `approveBroker` / `revokeBroker`.
 - `createModuleCollection(artist)` creates a ledger-only collection (used for ARTIFACTS);
   `approveModule(module, collection)` lets a module call `recordSale{value}` and `recordResale{value}`.
+  `revokeModule` stops that (`isModule` becomes false) but keeps `moduleCollection` on record, so
+  `moduleRoyaltyReceiver` and every ARTIFACTS piece's ERC-2981 `royaltyInfo` keep resolving.
 - Split per collection in basis points, default broker 1500 / house 1500 / artist 7000, changed with
-  `setSplit` (must sum to 10 000). The house keeps rounding. A broker earns only if approved and not the
-  buyer; otherwise its share goes to the house.
+  `setSplit` (must sum to 10 000; for a plain SVG collection only while its sale is closed, like
+  `setPrices`). The house keeps rounding. A broker earns only if approved and not the buyer; otherwise its
+  share goes to the house.
 - Balances are per account and currency (`address(0)` = ETH, the IMD address = IMD). `withdraw(currency)`
   pays the caller; `withdrawHouse(currency)` pays the house balance to the current owner. ETH is sent by
   `call`; a receiver that rejects ETH only blocks its own balance.
@@ -62,11 +68,19 @@ then `acceptOwnership`); `renounceOwnership` reverts.
 curator or the collection's artist), `uploadChunk(collection, pieceId, index, data)` (index must be the next
 chunk; curator or artist), `clearPiece` (curator, until finalized), `finalizePiece` (checks keccak256 of the
 stored bytes against `contentHash`), `seal(collection)` (every piece finalized). Pieces over 100 KB are
-rejected. `setPrices(collection, priceEth, priceImd)` only while the sale is closed; `openSale` needs a sealed
+rejected, and a single chunk may hold at most 24 575 bytes (one SSTORE2 contract under EIP-170; larger
+chunks revert `ChunkTooLarge` instead of being silently truncated). Reading a piece allocates it once and
+copies each chunk at its offset, so finalize and `tokenURI` cost the same whatever the chunking (a 100 KB
+piece in 100 chunks finalizes well under 30M gas). Two curator-only repairs exist for a piece that is not
+yet finalized in an unsealed collection: `redescribePiece(collection, pieceId, contentHash, title,
+description)` replaces a wrong hash or text without re-uploading, and `dropLastPiece(collection)` removes
+the last registered piece so `pieceCount` shrinks and the seal is never blocked by a mistaken
+registration. `setPrices(collection, priceEth, priceImd)` only while the sale is closed; `openSale` needs a sealed
 collection and a price. `mint(collection, pieceId, broker)` takes exactly the ETH price;
 `mintWithIMD(collection, pieceId, broker, price)` reverts unless `price` equals the current IMD price and
 then pulls exactly that (fee-on-transfer amounts are rejected). `tokenURI` is on-chain base64 JSON whose
-image is the stored SVG.
+image is the stored SVG; the title and description are JSON-escaped (quotes, backslashes, control
+characters), so any registered text yields a valid document.
 
 Submissions: anyone calls `submit(contentHash, previewURI)`; the curator `acceptSubmission` /
 `rejectSubmission` once.
@@ -78,7 +92,8 @@ Submissions: anyone calls `submit(contentHash, previewURI)`; the curator `accept
    AES-256-GCM encrypted seed, stored with SSTORE2; commitment: keccak256 of the content key), then
    `lock()`. Nothing can change afterwards.
 2. **Edition sale** (`ArtifactsSale`). Starts closed. `setPrice` (above zero, only while closed),
-   `openSale` (needs the price, the VRF configuration and the locked factory), `closeSale`. `buy(broker)`
+   `openSale` (needs the price, the VRF configuration, the locked factory and `ArtifactsFactory.sale()`
+   naming this contract, so no purchase can be taken that the callback could never assign), `closeSale`. `buy(broker)`
    pays exactly the price through `ArtHouse.recordSale` and requests one VRF v2.5 word; the callback
    assigns a random unassigned edition with a Fisher-Yates pool, so no edition is assigned twice or skipped.
    Purchases are capped at 255. If a callback never arrives, the curator may `retryRequest(purchaseId)`
@@ -94,15 +109,24 @@ Submissions: anyone calls `submit(contentHash, previewURI)`; the curator `accept
 5. **Resale** (`ArtifactsEscrow`). The owner `list(pieceId, price)`; the buyer `buy(pieceId, viewingKey)`
    pays exactly the price and the piece moves into escrow; the seller `postKey(pieceId, rewrappedKey)`;
    the buyer `confirm` releases payment, or anyone `release` 72 hours after the key was posted; the buyer
-   may `cancel` until the key is posted (refund by pull with `withdrawRefund`). The escrow is an operator on
+   may `cancel` until the key is posted (refund by pull with `withdrawRefund`); a cancel returns the piece
+   to the seller with the seller's own wrapped key restored (the escrow saved it at purchase). A listing is
+   bound to the piece's `transferCount` when listed, so any transfer, even one that brings the piece back
+   to the seller, kills it (`ListingStale`) and the seller must list again. The escrow is an operator on
    every piece so it can move a listed piece without a separate approval; it only ever moves a piece from
-   its listed seller. Plain ERC-721 transfers stay allowed: a transfer clears the wrapped key and records
-   the previous owner, who may `setWrappedKey` for the new owner (the current owner may too).
+   its listed seller. If the curator revoked the escrow as a module while a resale is in flight, release
+   still delivers the piece and holds the full price for the seller in `refunds` (no royalty is taken), so
+   neither party is stranded. Plain ERC-721 transfers stay allowed: a transfer clears the wrapped key and
+   records the previous owner, who may `setWrappedKey` for the new owner only while the new owner has no
+   key yet (the current owner may post or replace at any time).
 6. **THE SOURCE** (`ArtifactsAuction`). The curator `configure(reserve, endTime)` (re-runnable while no bid
-   exists). `bid()` must meet the reserve and beat the high bid by at least 5%; a bid in the final
-   10 minutes moves the end to 10 minutes after it; outbid bids are refunded by pull. After the end anyone
-   `settle()`: proceeds go through `ArtHouse.recordSale` (no broker, so the broker share goes to the
-   house) and THE SOURCE is assigned to the winner, who claims it like an edition.
+   exists; needs the locked factory to name this contract as its auction). `bid()` must meet the reserve
+   and beat the high bid by at least 5%, rounded up, so a bid is never merely equal to the high bid; a bid
+   in the final 10 minutes moves the end to 10 minutes after it; outbid bids are refunded by pull. After
+   the end anyone `settle()`: proceeds go through `ArtHouse.recordSale` (no broker, so the broker share
+   goes to the house) and THE SOURCE is assigned to the winner, who claims it like an edition. If the
+   auction was revoked as a module, settle still assigns THE SOURCE and keeps the winning bid in
+   `heldProceeds`; anyone calls `forwardProceeds()` once the curator re-approves the module.
 
 ## After launch (owner actions, in order)
 
@@ -136,16 +160,32 @@ from the brief and only used through `IERC20` on first use; the Chainlink coordi
 - `SEED NNN` in an edition's seal is the piece number (the seed itself is secret).
 - R9's on-chain render of THE SOURCE and the write-once `revealed` flag described in PROTOCOL.md are not in
   the brief given for this task and are not implemented; THE SOURCE serves its MASTER seal.
-- Trait strings are curator-supplied and are not JSON-escaped; the curator must not use quotes or
-  backslashes in them.
+- ARTIFACTS trait strings are curator-supplied, locked forever and embedded in both the seal SVG and its
+  JSON without escaping; the curator must not use quotes, backslashes, `<` or `&` in them. Plain SVG
+  collection titles and descriptions, which artists may write, are JSON-escaped.
+- A chunk is capped at 24 575 bytes by the SSTORE2 contract size; the 100 KB piece limit is reached with
+  several chunks.
 
 ## Trust assumptions
 
 The curator can approve or revoke artists, brokers and modules, set splits and prices, open and close sales,
-clear unfinalized pieces, upload and lock ARTIFACTS data, post wrapped keys, retry VRF requests and
-withdraw the house balance. The curator holds every content key until the last claim (PROTOCOL.md). A
-dishonest seller can post a wrapped key that does not open; the contract cannot verify it. None of the
-owner powers can mint without payment, move a buyer's token, or take another party's ledger balance.
+clear, redescribe or drop unfinalized pieces, upload and lock ARTIFACTS data, post wrapped keys, retry VRF
+requests and withdraw the house balance. The curator holds every content key until the last claim
+(PROTOCOL.md) and may refuse to post one; the contract cannot force it. A dishonest seller can post a
+wrapped key that does not open; the contract cannot verify it. None of the owner powers can mint without
+payment, move a buyer's token, or take another party's ledger balance.
+
+Powers buyers should know about:
+
+- The split of a plain SVG collection can only change while its sale is closed. The ARTIFACTS collection
+  has no sale state in the ledger (its sale lives in ArtifactsSale), so the curator can change its split at
+  any time, including while the edition sale is open. The buyer's price never changes; only how it is
+  divided between artist, house and broker.
+- Edition randomness is only as trustworthy as the VRF coordinator the curator configures once with
+  `configureVRF`. Buyers should check that it is Chainlink's published VRF v2.5 coordinator for the chain.
+- Revoking a module stops it from recording sales. The escrow and the auction fall back to holding
+  proceeds for pull (see above), so a revocation never freezes a buyer's ETH or piece; it does redirect the
+  seller's proceeds away from the royalty split until the module is approved again.
 
 ## Development
 

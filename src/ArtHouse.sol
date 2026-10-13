@@ -61,7 +61,10 @@ contract ArtHouse is HouseOwnable, ReentrancyGuard {
 
     mapping(address => Artist) internal _artists;
     mapping(address => bool) public isBroker;
+    /// @notice The collection a module is, or was last, approved for. Kept after revocation for royalty lookups.
     mapping(address module => uint256 collection) public moduleCollection;
+    /// @notice Whether a module may currently record sales.
+    mapping(address module => bool) public isModule;
     uint256 public collectionCount;
     mapping(uint256 => Collection) internal _collections;
     /// @notice account => currency => withdrawable amount. The house's own balance sits under address(this).
@@ -129,10 +132,16 @@ contract ArtHouse is HouseOwnable, ReentrancyGuard {
 
     // ---------------------------------------------------------------- roles
 
+    /// @notice Approves an artist, or renames one already approved. The payout address belongs to the artist:
+    ///         re-approving an approved artist keeps the payout it chose and ignores `payout`.
     function approveArtist(address artist_, string calldata name, address payout) external onlyOwner {
         if (artist_ == address(0) || payout == address(0)) revert ZeroAddress();
         if (bytes(name).length == 0) revert EmptyName();
-        _artists[artist_] = Artist({name: name, payout: payout, approved: true});
+        Artist storage a = _artists[artist_];
+        if (a.approved) payout = a.payout;
+        a.name = name;
+        a.payout = payout;
+        a.approved = true;
         emit ArtistApproved(artist_, name, payout);
     }
 
@@ -169,11 +178,14 @@ contract ArtHouse is HouseOwnable, ReentrancyGuard {
         if (module == address(0)) revert ZeroAddress();
         _requireCollection(collection_);
         moduleCollection[module] = collection_;
+        isModule[module] = true;
         emit ModuleApproved(module, collection_);
     }
 
+    /// @notice Stops a module from recording sales. The collection it was approved for stays on record so royalty
+    ///         lookups through the module keep resolving.
     function revokeModule(address module) external onlyOwner {
-        delete moduleCollection[module];
+        isModule[module] = false;
         emit ModuleRevoked(module);
     }
 
@@ -211,8 +223,11 @@ contract ArtHouse is HouseOwnable, ReentrancyGuard {
         c.artistBps = DEFAULT_ARTIST_BPS;
     }
 
+    /// @notice Sets a collection's split. For a plain SVG collection only while its sale is closed, like setPrices.
+    ///         A module collection's sale state lives in its module, so its split is a curator power at any time.
     function setSplit(uint256 collection_, uint16 brokerBps, uint16 houseBps, uint16 artistBps) external onlyOwner {
         Collection storage c = _requireCollection(collection_);
+        if (c.open) revert SaleOpen();
         if (uint256(brokerBps) + houseBps + artistBps != BPS) revert BadSplit();
         c.brokerBps = brokerBps;
         c.houseBps = houseBps;
@@ -257,6 +272,24 @@ contract ArtHouse is HouseOwnable, ReentrancyGuard {
     function clearPiece(uint256 collection_, uint256 pieceId) external onlyOwner {
         _requireSvgCollection(collection_);
         artStorage.clearPiece(collection_, pieceId);
+    }
+
+    /// @notice Curator repair of an unfinalized piece's content hash, title and description.
+    function redescribePiece(
+        uint256 collection_,
+        uint256 pieceId,
+        bytes32 contentHash,
+        string calldata title,
+        string calldata description
+    ) external onlyOwner {
+        _requireSvgCollection(collection_);
+        artStorage.redescribePiece(collection_, pieceId, contentHash, title, description);
+    }
+
+    /// @notice Curator removal of the last registered piece while it is not finalized and the collection is unsealed.
+    function dropLastPiece(uint256 collection_) external onlyOwner {
+        _requireSvgCollection(collection_);
+        artStorage.dropLastPiece(collection_);
     }
 
     function finalizePiece(uint256 collection_, uint256 pieceId) external {
@@ -321,16 +354,14 @@ contract ArtHouse is HouseOwnable, ReentrancyGuard {
 
     /// @notice An approved module records an ETH sale it collected; the value is split like any house sale.
     function recordSale(address buyer, address broker) external payable nonReentrant {
-        uint256 id = moduleCollection[msg.sender];
-        if (id == 0) revert NotModule();
+        uint256 id = _requireModule(msg.sender);
         if (msg.value == 0) revert WrongPayment();
         _split(id, _collections[id], buyer, broker, ETH, msg.value);
     }
 
     /// @notice An approved module records an ETH resale: the artist royalty is kept, the rest is credited to the seller.
     function recordResale(address seller) external payable nonReentrant {
-        uint256 id = moduleCollection[msg.sender];
-        if (id == 0) revert NotModule();
+        uint256 id = _requireModule(msg.sender);
         if (msg.value == 0 || seller == address(0)) revert WrongPayment();
         uint256 royalty = msg.value * ROYALTY_BPS / BPS;
         _credit(_artists[_collections[id].artist].payout, ETH, royalty);
@@ -418,6 +449,11 @@ contract ArtHouse is HouseOwnable, ReentrancyGuard {
         emit Credited(account, currency, amount);
     }
 
+    function _requireModule(address module) internal view returns (uint256 id) {
+        if (!isModule[module]) revert NotModule();
+        id = moduleCollection[module];
+    }
+
     function _requireCollection(uint256 id) internal view returns (Collection storage c) {
         if (id == 0 || id > collectionCount) revert UnknownCollection();
         c = _collections[id];
@@ -428,9 +464,12 @@ contract ArtHouse is HouseOwnable, ReentrancyGuard {
         if (c.token == address(0)) revert NotSvgCollection();
     }
 
+    /// @dev The curator always; the collection's artist only while still approved.
     function _requireCuratorOrArtist(uint256 id) internal view {
         Collection storage c = _requireSvgCollection(id);
-        if (msg.sender != owner() && msg.sender != c.artist) revert NotCuratorOrArtist();
+        if (msg.sender == owner()) return;
+        if (msg.sender != c.artist) revert NotCuratorOrArtist();
+        if (!_artists[c.artist].approved) revert NotApprovedArtist();
     }
 
     function _requireFinalized(uint256 id, uint256 pieceId) internal view {

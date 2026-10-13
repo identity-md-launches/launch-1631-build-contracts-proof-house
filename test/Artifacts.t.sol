@@ -456,6 +456,12 @@ contract ArtifactsEscrowTest is Fixture {
         escrow.buy{value: 2 ether}(e, bytes32(uint256(1)));
         vm.prank(address(0xC0));
         piece.transferFrom(address(0xC0), ALICE, e);
+        // back with the seller, but the listing died with the transfer: it must be made again
+        vm.prank(BOB);
+        vm.expectRevert(ArtifactsEscrow.ListingStale.selector);
+        escrow.buy{value: 2 ether}(e, bytes32(uint256(1)));
+        vm.prank(ALICE);
+        escrow.list(e, 2 ether);
 
         vm.prank(BOB);
         escrow.buy{value: 2 ether}(e, bytes32(uint256(0xB0B)));
@@ -556,6 +562,137 @@ contract ArtifactsEscrowTest is Fixture {
         vm.expectRevert();
         piece.transferFrom(ALICE, BOB, e);
     }
+
+    function test_cancelRestoresSellerWrappedKey() public {
+        bytes memory before = piece.wrappedKey();
+        assertGt(before.length, 0);
+        _listAndBuy();
+        assertEq(piece.wrappedKey(), "");
+        vm.prank(BOB);
+        escrow.cancel(e);
+        assertEq(piece.ownerOf(e), ALICE);
+        assertEq(piece.wrappedKey(), before);
+        assertEq(piece.keyHolder(), ALICE);
+        // a seller that had no key (after a plain transfer) gets none back, and cancel still succeeds
+        vm.prank(ALICE);
+        piece.transferFrom(ALICE, address(0xC0), e);
+        vm.prank(address(0xC0));
+        escrow.list(e, 1 ether);
+        vm.prank(BOB);
+        escrow.buy{value: 1 ether}(e, bytes32(uint256(2)));
+        vm.prank(BOB);
+        escrow.cancel(e);
+        assertEq(piece.ownerOf(e), address(0xC0));
+        assertEq(piece.wrappedKey(), "");
+    }
+
+    function test_releaseWhenModuleRevokedHoldsPriceForSellerAndStillDelivers() public {
+        _listAndBuy();
+        vm.prank(ALICE);
+        escrow.postKey(e, "rewrapped");
+        vm.prank(OWNER);
+        house.revokeModule(address(escrow));
+        vm.prank(BOB);
+        vm.expectRevert(ArtifactsEscrow.KeyAlreadyPosted.selector);
+        escrow.cancel(e);
+        uint256 artistBefore = house.balances(ARTIST_PAYOUT, ETH);
+        vm.prank(BOB);
+        escrow.confirm(e);
+        assertEq(piece.ownerOf(e), BOB);
+        assertEq(piece.wrappedKey(), "rewrapped");
+        assertEq(escrow.refunds(ALICE), 2 ether);
+        assertEq(house.balances(ARTIST_PAYOUT, ETH), artistBefore);
+        assertEq(house.balances(ALICE, ETH), 0);
+        uint256 bal = ALICE.balance;
+        vm.prank(ALICE);
+        escrow.withdrawRefund();
+        assertEq(ALICE.balance - bal, 2 ether);
+        assertEq(address(escrow).balance, 0);
+    }
+
+    function test_previousOwnerCannotOverwriteAPostedKey() public {
+        vm.prank(ALICE);
+        piece.transferFrom(ALICE, BOB, e);
+        vm.prank(BOB);
+        piece.setWrappedKey("bob-good");
+        vm.prank(ALICE);
+        vm.expectRevert(ArtifactsPiece.NotKeyPoster.selector);
+        piece.setWrappedKey("garbage");
+        assertEq(piece.wrappedKey(), "bob-good");
+        // the previous owner may post first, once, and the holder may still replace it afterwards
+        vm.prank(BOB);
+        piece.transferFrom(BOB, address(0xC0), e);
+        vm.prank(BOB);
+        piece.setWrappedKey("for-c0");
+        vm.prank(BOB);
+        vm.expectRevert(ArtifactsPiece.NotKeyPoster.selector);
+        piece.setWrappedKey("for-c0-again");
+        vm.prank(address(0xC0));
+        piece.setWrappedKey("c0-own");
+        assertEq(piece.wrappedKey(), "c0-own");
+        assertEq(piece.transferCount(), 2);
+    }
+
+    function test_royaltyInfoSurvivesFactoryModuleRevocation() public {
+        (address receiver, uint256 amount) = piece.royaltyInfo(e, 1 ether);
+        assertEq(receiver, ARTIST_PAYOUT);
+        assertEq(amount, 0.075 ether);
+        vm.prank(OWNER);
+        house.revokeModule(address(factory));
+        (receiver,) = piece.royaltyInfo(e, 1 ether);
+        assertEq(receiver, ARTIST_PAYOUT);
+        assertFalse(house.isModule(address(factory)));
+        assertEq(house.moduleCollection(address(factory)), artifactsCollection);
+    }
+}
+
+contract ArtifactsWiringTest is Fixture {
+    ArtifactsFactory internal f2;
+    ArtifactsSale internal s2;
+    ArtifactsAuction internal a2;
+
+    function setUp() public override {
+        super.setUp();
+        f2 = new ArtifactsFactory(OWNER, address(house), address(pieceImpl));
+        s2 = new ArtifactsSale(OWNER, address(house), address(f2));
+        a2 = new ArtifactsAuction(OWNER, address(house), address(f2));
+        vm.startPrank(OWNER);
+        house.approveModule(address(s2), artifactsCollection);
+        house.approveModule(address(a2), artifactsCollection);
+        for (uint16 i = 1; i <= 256; ++i) {
+            f2.setPiece(i, traitsFor(i), abi.encodePacked("c", i), keccak256(abi.encodePacked("K", i)));
+        }
+        f2.lock();
+        s2.configureVRF(address(vrf), bytes32(uint256(1)), 7, false);
+        s2.setPrice(1 ether);
+        vm.stopPrank();
+    }
+
+    function test_openSaleAndConfigureNeedTheFactoryToNameThem() public {
+        vm.startPrank(OWNER);
+        vm.expectRevert(ArtifactsSale.FactoryNotWired.selector);
+        s2.openSale();
+        vm.expectRevert(ArtifactsAuction.FactoryNotWired.selector);
+        a2.configure(1 ether, uint64(block.timestamp + 1 days));
+        // wired to other contracts: still refused
+        f2.setModules(address(0xdead), address(0xdead), address(0xdead));
+        vm.expectRevert(ArtifactsSale.FactoryNotWired.selector);
+        s2.openSale();
+        vm.expectRevert(ArtifactsAuction.FactoryNotWired.selector);
+        a2.configure(1 ether, uint64(block.timestamp + 1 days));
+        vm.stopPrank();
+        assertFalse(s2.open());
+    }
+
+    function test_correctWiringOpens() public {
+        vm.startPrank(OWNER);
+        f2.setModules(address(s2), address(a2), address(escrow));
+        s2.openSale();
+        a2.configure(1 ether, uint64(block.timestamp + 1 days));
+        vm.stopPrank();
+        assertTrue(s2.open());
+        assertEq(a2.reserve(), 1 ether);
+    }
 }
 
 contract ArtifactsAuctionTest is Fixture {
@@ -590,6 +727,44 @@ contract ArtifactsAuctionTest is Fixture {
         auction.configure(2 ether, uint64(block.timestamp + 2 days));
     }
 
+    function test_dustBidsStillNeedAStrictIncrement() public {
+        vm.prank(OWNER);
+        auction.configure(1, uint64(block.timestamp + 1 days));
+        vm.prank(ALICE);
+        auction.bid{value: 19}();
+        assertEq(auction.minimumBid(), 20);
+        vm.prank(BOB);
+        vm.expectRevert(abi.encodeWithSelector(ArtifactsAuction.BelowIncrement.selector, 20));
+        auction.bid{value: 19}();
+        vm.prank(BOB);
+        auction.bid{value: 20}();
+        assertEq(auction.highBidder(), BOB);
+        assertEq(auction.minimumBid(), 21);
+    }
+
+    function test_settleWhileRevokedHoldsProceedsUntilForwarded() public {
+        _configure();
+        vm.prank(BOB);
+        auction.bid{value: 4 ether}();
+        vm.warp(auction.endTime());
+        vm.prank(OWNER);
+        house.revokeModule(address(auction));
+        auction.settle();
+        assertEq(factory.assignedTo(256), BOB);
+        assertEq(auction.heldProceeds(), 4 ether);
+        assertEq(house.balances(ARTIST_PAYOUT, ETH), 0);
+        vm.expectRevert(ArtHouse.NotModule.selector);
+        auction.forwardProceeds();
+        vm.prank(OWNER);
+        house.approveModule(address(auction), artifactsCollection);
+        auction.forwardProceeds();
+        assertEq(auction.heldProceeds(), 0);
+        assertEq(house.balances(ARTIST_PAYOUT, ETH), 2.8 ether);
+        assertEq(house.balances(address(house), ETH), 1.2 ether);
+        vm.expectRevert(ArtifactsAuction.NothingHeld.selector);
+        auction.forwardProceeds();
+    }
+
     function test_configureNeedsLockedFactory() public {
         ArtifactsFactory fresh = new ArtifactsFactory(OWNER, address(house), address(pieceImpl));
         ArtifactsAuction a = new ArtifactsAuction(OWNER, address(house), address(fresh));
@@ -606,6 +781,11 @@ contract ArtifactsAuctionTest is Fixture {
         vm.prank(ALICE);
         auction.bid{value: 1 ether}();
         assertEq(auction.minimumBid(), 1.05 ether);
+        // the 5% increment rounds up, so a bid never merely equals the high bid
+        assertEq(auction.minimumBid() - auction.highBid(), 0.05 ether);
+        vm.prank(BOB);
+        vm.expectRevert(abi.encodeWithSelector(ArtifactsAuction.BelowIncrement.selector, 1.05 ether));
+        auction.bid{value: 1 ether}();
         vm.prank(BOB);
         vm.expectRevert(abi.encodeWithSelector(ArtifactsAuction.BelowIncrement.selector, 1.05 ether));
         auction.bid{value: 1.04 ether}();

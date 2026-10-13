@@ -16,6 +16,10 @@ contract ArtifactsEscrow is ReentrancyGuard {
         address buyer;
         bytes wrappedKey;
         uint64 keyPostedAt;
+        /// @dev The piece's transfer count when listed; any transfer in between kills the listing.
+        uint64 epoch;
+        /// @dev The seller's own wrapped key at purchase time, restored if the buyer cancels.
+        bytes sellerKey;
     }
 
     uint64 public constant RELEASE_DELAY = 72 hours;
@@ -32,6 +36,7 @@ contract ArtifactsEscrow is ReentrancyGuard {
     event KeyPosted(uint16 indexed pieceId);
     event Cancelled(uint16 indexed pieceId, address indexed buyer);
     event Released(uint16 indexed pieceId, address indexed seller, address indexed buyer, uint256 price);
+    event ProceedsHeldForSeller(uint16 indexed pieceId, address indexed seller, uint256 price);
     event RefundWithdrawn(address indexed account, uint256 amount);
 
     error ZeroAddress();
@@ -40,6 +45,7 @@ contract ArtifactsEscrow is ReentrancyGuard {
     error NoPrice();
     error ListingFunded();
     error NotListed();
+    error ListingStale();
     error NotSeller();
     error NotBuyer();
     error WrongPayment();
@@ -70,6 +76,7 @@ contract ArtifactsEscrow is ReentrancyGuard {
         if (l.buyer != address(0)) revert ListingFunded();
         l.seller = msg.sender;
         l.price = price;
+        l.epoch = piece.transferCount();
         emit Listed(pieceId, msg.sender, price);
     }
 
@@ -83,6 +90,7 @@ contract ArtifactsEscrow is ReentrancyGuard {
     }
 
     /// @notice Pays exactly the listed price and registers the buyer's viewing key; the piece moves into escrow.
+    ///         A listing made before any transfer of the piece, even one that returned it to the seller, is stale.
     function buy(uint16 pieceId, bytes32 viewingPublicKey) external payable nonReentrant {
         Listing storage l = _listings[pieceId];
         if (l.seller == address(0)) revert NotListed();
@@ -91,7 +99,9 @@ contract ArtifactsEscrow is ReentrancyGuard {
         if (msg.sender == l.seller) revert SellerCannotBuy();
         IArtifactsPiece piece = _piece(pieceId);
         if (piece.ownerOf(pieceId) != l.seller) revert NotPieceOwner();
+        if (piece.transferCount() != l.epoch) revert ListingStale();
         l.buyer = msg.sender;
+        l.sellerKey = piece.wrappedKey();
         emit Bought(pieceId, msg.sender, msg.value);
         factory.registerViewingKeyFor(msg.sender, viewingPublicKey);
         piece.transferFrom(l.seller, address(this), pieceId);
@@ -109,7 +119,8 @@ contract ArtifactsEscrow is ReentrancyGuard {
         emit KeyPosted(pieceId);
     }
 
-    /// @notice The buyer may cancel until the key is posted: the piece returns to the seller, the payment is refundable.
+    /// @notice The buyer may cancel until the key is posted: the piece returns to the seller with the seller's own
+    ///         wrapped key restored, and the payment is refundable.
     function cancel(uint16 pieceId) external nonReentrant {
         Listing memory l = _listings[pieceId];
         if (l.buyer == address(0)) revert NotListed();
@@ -118,7 +129,9 @@ contract ArtifactsEscrow is ReentrancyGuard {
         delete _listings[pieceId];
         refunds[l.buyer] += l.price;
         emit Cancelled(pieceId, l.buyer);
-        _piece(pieceId).transferFrom(address(this), l.seller, pieceId);
+        IArtifactsPiece piece = _piece(pieceId);
+        piece.transferFrom(address(this), l.seller, pieceId);
+        if (l.sellerKey.length != 0) piece.setWrappedKey(l.sellerKey);
     }
 
     /// @notice The buyer confirms the key opens the piece: payment releases now.
@@ -148,13 +161,21 @@ contract ArtifactsEscrow is ReentrancyGuard {
         if (!ok) revert EthTransferFailed();
     }
 
+    /// @dev The piece goes to the buyer in every case. Proceeds go through the ledger while this escrow is an
+    ///      approved module; if the curator revoked it mid-resale, the full price is held here for the seller to
+    ///      pull, so neither party is ever stranded.
     function _release(uint16 pieceId, Listing memory l) internal {
         delete _listings[pieceId];
         emit Released(pieceId, l.seller, l.buyer, l.price);
+        bool ledgerOpen = house.isModule(address(this));
+        if (!ledgerOpen) {
+            refunds[l.seller] += l.price;
+            emit ProceedsHeldForSeller(pieceId, l.seller, l.price);
+        }
         IArtifactsPiece piece = _piece(pieceId);
         piece.transferFrom(address(this), l.buyer, pieceId);
         piece.setWrappedKey(l.wrappedKey);
-        house.recordResale{value: l.price}(l.seller);
+        if (ledgerOpen) house.recordResale{value: l.price}(l.seller);
     }
 
     function _piece(uint16 pieceId) internal view returns (IArtifactsPiece piece) {

@@ -9,6 +9,8 @@ interface IArtifactsFactory {
         view
         returns (Traits memory traits, address ciphertext, bytes32 commitment);
     function royaltyReceiver() external view returns (address);
+    function sale() external view returns (address);
+    function auction() external view returns (address);
     function escrow() external view returns (address);
     function locked() external view returns (bool);
     function pieceContract(uint16 pieceId) external view returns (address);
@@ -21,6 +23,8 @@ interface IArtifactsFactory {
 interface IArtifactsPiece {
     function initialize(uint16 pieceId, address owner_, bytes calldata wrappedKey_) external;
     function setWrappedKey(bytes calldata wrapped) external;
+    function wrappedKey() external view returns (bytes memory);
+    function transferCount() external view returns (uint64);
     function ownerOf(uint256 tokenId) external view returns (address);
     function transferFrom(address from, address to, uint256 tokenId) external;
 }
@@ -29,4 +33,5 @@ interface IArtHouseLedger {
     function recordSale(address buyer, address broker) external payable;
     function recordResale(address seller) external payable;
     function moduleRoyaltyReceiver(address module) external view returns (address);
+    function isModule(address module) external view returns (bool);
 }

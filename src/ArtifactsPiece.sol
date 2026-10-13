@@ -25,6 +25,8 @@ contract ArtifactsPiece is ERC721, IERC2981 {
     address public keyHolder;
     /// @notice The owner before the last transfer; it may post the re-wrapped key for the new owner.
     address public previousOwner;
+    /// @notice Number of transfers since the mint. Escrow listings are bound to it, so a listing dies with a transfer.
+    uint64 public transferCount;
     bool internal _initialized;
 
     event WrappedKeySet(address indexed holder, address indexed by);
@@ -56,11 +58,13 @@ contract ArtifactsPiece is ERC721, IERC2981 {
     // ---------------------------------------------------------------- keys
 
     /// @notice Posts the content key wrapped to the current owner's viewing key. Allowed for the current owner,
-    ///         the previous owner (after a plain transfer), the factory and the factory's escrow.
+    ///         the factory and the factory's escrow at any time, and for the previous owner (after a plain
+    ///         transfer) only while the new owner has no key yet, so it can never overwrite a posted one.
     function setWrappedKey(bytes calldata wrapped) external {
         address owner_ = ownerOf(pieceId);
+        bool previousMayPost = msg.sender == previousOwner && wrappedKey.length == 0;
         if (
-            msg.sender != owner_ && msg.sender != previousOwner && msg.sender != factory
+            msg.sender != owner_ && !previousMayPost && msg.sender != factory
                 && msg.sender != IArtifactsFactory(factory).escrow()
         ) revert NotKeyPoster();
         if (wrapped.length == 0) revert EmptyKey();
@@ -69,13 +73,17 @@ contract ArtifactsPiece is ERC721, IERC2981 {
         emit WrappedKeySet(owner_, msg.sender);
     }
 
-    /// @dev Any transfer to a new holder clears the wrapped key and remembers who may re-wrap.
+    /// @dev Any transfer bumps the transfer count; a transfer to a new holder also clears the wrapped key and
+    ///      remembers who may re-wrap.
     function _update(address to, uint256 tokenId, address auth) internal override returns (address from) {
         from = super._update(to, tokenId, auth);
-        if (from != address(0) && to != keyHolder) {
-            delete wrappedKey;
-            previousOwner = from;
-            keyHolder = to;
+        if (from != address(0)) {
+            transferCount += 1;
+            if (to != keyHolder) {
+                delete wrappedKey;
+                previousOwner = from;
+                keyHolder = to;
+            }
         }
     }
 

@@ -6,6 +6,7 @@ import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 import {IERC2981} from "@openzeppelin/contracts/interfaces/IERC2981.sol";
 import {Base64} from "@openzeppelin/contracts/utils/Base64.sol";
 import {ArtStorage} from "./ArtStorage.sol";
+import {JsonEscape} from "./libraries/JsonEscape.sol";
 
 interface IArtHouseRoyalty {
     function royaltyReceiver(uint256 collection) external view returns (address);
@@ -74,9 +75,9 @@ contract ArtCollection is ERC721, IERC2981 {
         bytes memory svg = artStorage.pieceBytes(collectionId, tokenId);
         bytes memory json = abi.encodePacked(
             '{"name":"',
-            title,
+            JsonEscape.escape(title),
             '","description":"',
-            description,
+            JsonEscape.escape(description),
             '","image":"data:image/svg+xml;base64,',
             Base64.encode(svg),
             '"}'

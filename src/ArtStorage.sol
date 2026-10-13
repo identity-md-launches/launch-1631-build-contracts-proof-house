@@ -19,6 +19,8 @@ contract ArtStorage is HouseOwnable {
 
     /// @notice Largest piece accepted, in bytes (100 KB).
     uint256 public constant MAX_PIECE_BYTES = 100 * 1024;
+    /// @notice Largest single chunk: one SSTORE2 contract holds at most 24 575 bytes (EIP-170 minus the STOP byte).
+    uint256 public constant MAX_CHUNK_BYTES = SSTORE2.MAX_DATA_BYTES;
 
     address public house;
     mapping(uint256 collection => uint256) public pieceCount;
@@ -31,6 +33,8 @@ contract ArtStorage is HouseOwnable {
         uint256 indexed collection, uint256 indexed pieceId, uint256 index, address pointer, uint256 size
     );
     event PieceCleared(uint256 indexed collection, uint256 indexed pieceId);
+    event PieceRedescribed(uint256 indexed collection, uint256 indexed pieceId, bytes32 contentHash, string title);
+    event PieceDropped(uint256 indexed collection, uint256 indexed pieceId);
     event PieceFinalized(uint256 indexed collection, uint256 indexed pieceId);
     event CollectionSealed(uint256 indexed collection);
 
@@ -43,7 +47,9 @@ contract ArtStorage is HouseOwnable {
     error PieceFinalizedAlready();
     error ChunkIndexNotNext(uint256 expected);
     error EmptyChunk();
+    error ChunkTooLarge();
     error PieceTooLarge();
+    error SizeMismatch();
     error EmptyPiece();
     error ContentHashMismatch(bytes32 expected, bytes32 actual);
     error PieceNotFinalized(uint256 pieceId);
@@ -89,6 +95,7 @@ contract ArtStorage is HouseOwnable {
         if (p.finalized) revert PieceFinalizedAlready();
         if (index != p.chunks.length) revert ChunkIndexNotNext(p.chunks.length);
         if (data.length == 0) revert EmptyChunk();
+        if (data.length > MAX_CHUNK_BYTES) revert ChunkTooLarge();
         uint256 newSize = uint256(p.size) + data.length;
         if (newSize > MAX_PIECE_BYTES) revert PieceTooLarge();
         address pointer = SSTORE2.write(data);
@@ -103,6 +110,36 @@ contract ArtStorage is HouseOwnable {
         delete p.chunks;
         p.size = 0;
         emit PieceCleared(collection, pieceId);
+    }
+
+    /// @notice Repairs the content hash, title and description of a piece that is not yet finalized.
+    function redescribePiece(
+        uint256 collection,
+        uint256 pieceId,
+        bytes32 contentHash,
+        string calldata title,
+        string calldata description
+    ) external onlyHouse {
+        if (isSealed[collection]) revert CollectionSealedAlready();
+        Piece storage p = _piece(collection, pieceId);
+        if (p.finalized) revert PieceFinalizedAlready();
+        p.contentHash = contentHash;
+        p.title = title;
+        p.description = description;
+        emit PieceRedescribed(collection, pieceId, contentHash, title);
+    }
+
+    /// @notice Removes the last registered piece of an unsealed collection if it is not finalized, so a piece
+    ///         registered by mistake does not block the seal forever. pieceCount shrinks by one.
+    function dropLastPiece(uint256 collection) external onlyHouse {
+        if (isSealed[collection]) revert CollectionSealedAlready();
+        uint256 pieceId = pieceCount[collection];
+        if (pieceId == 0) revert NoPieces();
+        Piece storage p = _pieces[collection][pieceId];
+        if (p.finalized) revert PieceFinalizedAlready();
+        delete _pieces[collection][pieceId];
+        pieceCount[collection] = pieceId - 1;
+        emit PieceDropped(collection, pieceId);
     }
 
     function finalizePiece(uint256 collection, uint256 pieceId) external onlyHouse {
@@ -157,10 +194,15 @@ contract ArtStorage is HouseOwnable {
         p = _pieces[collection][pieceId];
     }
 
+    /// @dev Allocates the whole piece once and copies every chunk at its offset, so the cost is linear in the
+    ///      piece size whatever the chunking.
     function _read(Piece storage p) internal view returns (bytes memory data) {
+        data = new bytes(p.size);
         uint256 n = p.chunks.length;
+        uint256 offset;
         for (uint256 i; i < n; ++i) {
-            data = bytes.concat(data, SSTORE2.read(p.chunks[i]));
+            offset += SSTORE2.readInto(p.chunks[i], data, offset);
         }
+        if (offset != data.length) revert SizeMismatch();
     }
 }

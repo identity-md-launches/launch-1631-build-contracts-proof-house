@@ -74,6 +74,7 @@ contract ArtifactsSale is HouseOwnable, ReentrancyGuard {
     error WrongPayment();
     error SoldOut();
     error FactoryNotLocked();
+    error FactoryNotWired();
     error UnknownPurchase();
     error AlreadyAssigned();
     error TooEarly();
@@ -108,10 +109,13 @@ contract ArtifactsSale is HouseOwnable, ReentrancyGuard {
         emit PriceSet(price_);
     }
 
+    /// @notice Opens the sale. Needs a price, the VRF configuration, the locked factory and the factory naming this
+    ///         contract as its sale, so no purchase can be taken that the callback could never assign.
     function openSale() external onlyOwner {
         if (price == 0) revert NoPrice();
         if (vrfCoordinator == address(0)) revert VRFNotConfigured();
         if (!factory.locked()) revert FactoryNotLocked();
+        if (factory.sale() != address(this)) revert FactoryNotWired();
         open = true;
         emit SaleOpened();
     }

@@ -464,4 +464,174 @@ contract ArtHouseTest is Fixture {
         house.rejectSubmission(2);
         assertEq(uint8(house.submission(2).status), uint8(ArtHouse.SubmissionStatus.Rejected));
     }
+
+    // ---------------------------------------------------------------- revision: storage and access repairs
+
+    function test_readCostIsLinearIn100KBOfSmallChunks() public {
+        bytes memory chunk = new bytes(1024);
+        for (uint256 i; i < chunk.length; ++i) {
+            chunk[i] = bytes1(uint8(65 + i % 26));
+        }
+        bytes memory all;
+        for (uint256 i; i < 100; ++i) {
+            all = bytes.concat(all, chunk);
+        }
+        vm.startPrank(ARTIST);
+        house.registerPiece(col, 1, keccak256(all), "t", "d");
+        for (uint256 i; i < 100; ++i) {
+            house.uploadChunk(col, 1, i, chunk);
+        }
+        (bool finalized,) = address(house).call{gas: 30_000_000}(abi.encodeCall(ArtHouse.finalizePiece, (col, 1)));
+        vm.stopPrank();
+        assertTrue(finalized);
+        assertEq(artStorage.pieceBytes(col, 1), all);
+        vm.prank(OWNER);
+        house.seal(col);
+        _openEth(1 ether);
+        vm.prank(ALICE);
+        house.mint{value: 1 ether}(col, 1, address(0));
+        (bool rendered,) = address(token).staticcall{gas: 50_000_000}(abi.encodeCall(token.tokenURI, (1)));
+        assertTrue(rendered);
+    }
+
+    function test_chunksAboveOneSstore2ContractAreRejected() public {
+        vm.startPrank(ARTIST);
+        house.registerPiece(col, 1, keccak256("x"), "t", "d");
+        vm.expectRevert(ArtStorage.ChunkTooLarge.selector);
+        house.uploadChunk(col, 1, 0, new bytes(24_576));
+        vm.expectRevert(ArtStorage.ChunkTooLarge.selector);
+        house.uploadChunk(col, 1, 0, new bytes(65_535));
+        bytes memory max = new bytes(24_575);
+        house.uploadChunk(col, 1, 0, max);
+        vm.stopPrank();
+        assertEq(artStorage.pieceBytes(col, 1).length, 24_575);
+        assertEq(artStorage.chunkPointer(col, 1, 0).code.length, 24_576);
+    }
+
+    function test_curatorRepairsOrDropsAnUnfinalizedPiece() public {
+        vm.startPrank(ARTIST);
+        house.registerPiece(col, 1, keccak256("typo"), "T", "D");
+        house.uploadChunk(col, 1, 0, SVG);
+        vm.expectRevert(
+            abi.encodeWithSelector(ArtStorage.ContentHashMismatch.selector, keccak256("typo"), keccak256(SVG))
+        );
+        house.finalizePiece(col, 1);
+        // the artist cannot repair; the curator can, without re-uploading
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, ARTIST));
+        house.redescribePiece(col, 1, keccak256(SVG), "Piece", "fixed");
+        vm.stopPrank();
+        vm.prank(OWNER);
+        house.redescribePiece(col, 1, keccak256(SVG), "Piece", "fixed");
+        (bytes32 h, string memory title,,,,) = artStorage.pieceInfo(col, 1);
+        assertEq(h, keccak256(SVG));
+        assertEq(title, "Piece");
+        vm.prank(ARTIST);
+        house.finalizePiece(col, 1);
+        vm.prank(OWNER);
+        vm.expectRevert(ArtStorage.PieceFinalizedAlready.selector);
+        house.redescribePiece(col, 1, keccak256("other"), "x", "y");
+        // a junk piece registered after it is dropped, and the slot can be used again
+        vm.prank(ARTIST);
+        house.registerPiece(col, 2, bytes32(0), "junk", "");
+        vm.prank(OWNER);
+        vm.expectRevert(abi.encodeWithSelector(ArtStorage.PieceNotFinalized.selector, 2));
+        house.seal(col);
+        vm.prank(ARTIST);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, ARTIST));
+        house.dropLastPiece(col);
+        vm.prank(OWNER);
+        house.dropLastPiece(col);
+        assertEq(artStorage.pieceCount(col), 1);
+        vm.expectRevert(ArtStorage.UnknownPiece.selector);
+        artStorage.pieceInfo(col, 2);
+        vm.prank(OWNER);
+        vm.expectRevert(ArtStorage.PieceFinalizedAlready.selector);
+        house.dropLastPiece(col);
+        vm.prank(OWNER);
+        house.seal(col);
+        vm.prank(OWNER);
+        vm.expectRevert(ArtStorage.CollectionSealedAlready.selector);
+        house.dropLastPiece(col);
+        vm.prank(OWNER);
+        vm.expectRevert(ArtStorage.CollectionSealedAlready.selector);
+        house.redescribePiece(col, 1, keccak256("other"), "x", "y");
+        assertEq(token.maxSupply(), 1);
+    }
+
+    function test_revokedArtistLosesWriteAccessUntilReapproved() public {
+        vm.prank(OWNER);
+        house.revokeArtist(ARTIST);
+        vm.startPrank(ARTIST);
+        vm.expectRevert(ArtHouse.NotApprovedArtist.selector);
+        house.registerPiece(col, 1, keccak256(SVG), "t", "d");
+        vm.stopPrank();
+        vm.prank(OWNER);
+        house.registerPiece(col, 1, keccak256(SVG), "t", "d");
+        vm.startPrank(ARTIST);
+        vm.expectRevert(ArtHouse.NotApprovedArtist.selector);
+        house.uploadChunk(col, 1, 0, SVG);
+        vm.expectRevert(ArtHouse.NotApprovedArtist.selector);
+        house.finalizePiece(col, 1);
+        vm.stopPrank();
+        vm.prank(BOB);
+        vm.expectRevert(ArtHouse.NotCuratorOrArtist.selector);
+        house.uploadChunk(col, 1, 0, SVG);
+        vm.prank(OWNER);
+        house.approveArtist(ARTIST, "Myles", ARTIST_PAYOUT);
+        vm.startPrank(ARTIST);
+        house.uploadChunk(col, 1, 0, SVG);
+        house.finalizePiece(col, 1);
+        vm.stopPrank();
+    }
+
+    function test_reapprovingAnArtistKeepsItsPayout() public {
+        vm.prank(ARTIST);
+        house.setPayout(address(0xBEEF));
+        vm.prank(OWNER);
+        house.approveArtist(ARTIST, "Myles renamed", OWNER);
+        assertEq(house.artist(ARTIST).payout, address(0xBEEF));
+        assertEq(house.artist(ARTIST).name, "Myles renamed");
+        assertEq(house.royaltyReceiver(col), address(0xBEEF));
+        // after a revocation the curator sets the payout again
+        vm.startPrank(OWNER);
+        house.revokeArtist(ARTIST);
+        house.approveArtist(ARTIST, "Myles", ARTIST_PAYOUT);
+        vm.stopPrank();
+        assertEq(house.artist(ARTIST).payout, ARTIST_PAYOUT);
+    }
+
+    function test_setSplitOnlyWhileSvgSaleClosed() public {
+        _uploadAndSeal(col, 1);
+        _openEth(1 ether);
+        vm.prank(OWNER);
+        vm.expectRevert(ArtHouse.SaleOpen.selector);
+        house.setSplit(col, 0, 10_000, 0);
+        vm.startPrank(OWNER);
+        house.closeSale(col);
+        house.setSplit(col, 1000, 2000, 7000);
+        vm.stopPrank();
+        assertEq(house.collection(col).artistBps, 7000);
+    }
+
+    function test_tokenURIEscapesTitleAndDescription() public {
+        vm.startPrank(ARTIST);
+        house.registerPiece(col, 1, keccak256(SVG), 'A"B', "back\\slash\nline");
+        house.uploadChunk(col, 1, 0, SVG);
+        house.finalizePiece(col, 1);
+        vm.stopPrank();
+        vm.prank(OWNER);
+        house.seal(col);
+        _openEth(1 ether);
+        vm.prank(ALICE);
+        house.mint{value: 1 ether}(col, 1, address(0));
+        string memory json = B64.decodeDataURI(token.tokenURI(1), "data:application/json;base64,");
+        assertEq(
+            json,
+            string.concat(
+                '{"name":"A\\"B","description":"back\\\\slash\\u000aline","image":"data:image/svg+xml;base64,',
+                Base64.encode(SVG),
+                '"}'
+            )
+        );
+    }
 }
